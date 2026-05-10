@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Search,
@@ -25,8 +25,9 @@ import {
   ArrowRight,
   X,
 } from 'lucide-react';
-import { aiService, type DifficultyAnalysis } from '@/data/services/aiService';
+import { aiService, type DifficultyAnalysis, type KnowledgeGraph, type KnowledgeNode } from '@/data/services/aiService';
 import { subjects } from '@/data/mock/subjects';
+import { grades } from '@/data/mock/grades';
 import { useAppStore } from '@/store/useAppStore';
 
 type DetailTab = 'concept' | 'examples' | 'mistakes' | 'advanced';
@@ -107,219 +108,314 @@ function getSubjectTextClass(subjectId: string): string {
   return colorMap[subjectId] || 'text-primary-600 bg-primary-100';
 }
 
-interface MindMapNodeData {
+// ==================== 知识图谱可视化 ====================
+
+interface LayoutNode {
   id: string;
   label: string;
-  type: 'root' | 'branch' | 'leaf';
-  children: MindMapNodeData[];
-  x?: number;
-  y?: number;
+  type: KnowledgeNode['type'];
+  description?: string;
+  x: number;
+  y: number;
+  ring: number;
+  fx: number;
+  fy: number;
 }
 
-function MindMapVisualization({
-  data,
-  subjectId,
+const NODE_STYLE: Record<string, { fill: string; stroke: string; text: string; size: [number, number, number] }> = {
+  core:           { fill: '#7C3AED', stroke: '#6D28D9', text: '#fff',  size: [64, 28, 15] },  // 紫
+  'sub-concept':  { fill: '#DBEAFE', stroke: '#3B82F6', text: '#1E40AF', size: [56, 24, 13] },  // 蓝
+  theorem:        { fill: '#E0E7FF', stroke: '#6366F1', text: '#3730A3', size: [52, 22, 12] },  // 靛
+  case:           { fill: '#D1FAE5', stroke: '#10B981', text: '#065F46', size: [50, 22, 12] },  // 绿
+  misconception:  { fill: '#FEE2E2', stroke: '#EF4444', text: '#991B1B', size: [50, 22, 12] },  // 红
+};
+
+const EDGE_STYLE: Record<string, { dash: string; color: string; width: number }> = {
+  hierarchy:        { dash: '',           color: '#94A3B8', width: 2 },
+  causal:           { dash: '',           color: '#F59E0B', width: 2 },
+  analogy:          { dash: '6 3',        color: '#8B5CF6', width: 1.8 },
+  contrast:         { dash: '4 4',        color: '#64748B', width: 1.8 },
+  counterexample:   { dash: '5 3',        color: '#EF4444', width: 1.8 },
+};
+
+const TYPE_LABEL: Record<string, string> = {
+  core: '核心概念', 'sub-concept': '子概念', theorem: '定理/公式', case: '案例', misconception: '误区/反例',
+};
+
+function computeLayout(graph: KnowledgeGraph): LayoutNode[] {
+  const { nodes, edges } = graph;
+  if (nodes.length === 0) return [];
+
+  const core = nodes.find(n => n.type === 'core') || nodes[0];
+  const layoutNodes: LayoutNode[] = [];
+  const placed = new Set<string>();
+
+  // Root
+  layoutNodes.push({ ...core, x: 0, y: 0, ring: 0, fx: 0, fy: 0 });
+  placed.add(core.id);
+
+  // BFS: ring 1 = neighbors of root, ring 2 = neighbors of ring 1
+  const ring1Ids = new Set<string>();
+  const ring1Children = new Map<string, string[]>();
+
+  for (const e of edges) {
+    const other = e.source === core.id ? e.target : e.target === core.id ? e.source : null;
+    if (other && !placed.has(other)) {
+      ring1Ids.add(other);
+      placed.add(other);
+    }
+  }
+
+  // For each ring1 node, find its children (excluding root and other ring1)
+  for (const rid of ring1Ids) {
+    const children: string[] = [];
+    for (const e of edges) {
+      const other = e.source === rid ? e.target : e.target === rid ? e.source : null;
+      if (other && !placed.has(other)) {
+        children.push(other);
+        placed.add(other);
+      }
+    }
+    ring1Children.set(rid, children);
+  }
+
+  // Place ring 1 in a circle
+  const r1Arr = [...ring1Ids];
+  const r1Radius = 150;
+  r1Arr.forEach((id, i) => {
+    const angle = (2 * Math.PI * i) / r1Arr.length - Math.PI / 2;
+    const node = nodes.find(n => n.id === id)!;
+    layoutNodes.push({
+      ...node,
+      x: r1Radius * Math.cos(angle),
+      y: r1Radius * Math.sin(angle),
+      ring: 1,
+      fx: r1Radius * Math.cos(angle),
+      fy: r1Radius * Math.sin(angle),
+    });
+  });
+
+  // Place ring 2 children around their parent
+  let ring2Idx = 0;
+  for (const [parentId, childIds] of ring1Children) {
+    const parent = layoutNodes.find(n => n.id === parentId);
+    if (!parent) continue;
+    const r2Radius = 85;
+    childIds.forEach((cid) => {
+      const spreadAngle = childIds.length === 1 ? 0 : Math.PI / 4;
+      const baseAngle = Math.atan2(parent.y, parent.x);
+      const angle = baseAngle + (childIds.length === 1 ? 0 : -spreadAngle / 2 + (spreadAngle * ring2Idx) / Math.max(childIds.length - 1, 1));
+      ring2Idx++;
+      const node = nodes.find(n => n.id === cid)!;
+      layoutNodes.push({
+        ...node,
+        x: parent.x + r2Radius * Math.cos(angle),
+        y: parent.y + r2Radius * Math.sin(angle),
+        ring: 2,
+        fx: parent.x + r2Radius * Math.cos(angle),
+        fy: parent.y + r2Radius * Math.sin(angle),
+      });
+    });
+  }
+
+  // Remaining unplaced nodes
+  const unplaced = nodes.filter(n => !layoutNodes.some(ln => ln.id === n.id));
+  const outerRadius = 280;
+  unplaced.forEach((n, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(unplaced.length, 1) - Math.PI / 2;
+    layoutNodes.push({
+      ...n,
+      x: outerRadius * Math.cos(angle),
+      y: outerRadius * Math.sin(angle),
+      ring: 3,
+      fx: outerRadius * Math.cos(angle),
+      fy: outerRadius * Math.sin(angle),
+    });
+  });
+
+  return layoutNodes;
+}
+
+function KnowledgeGraphView({
+  graph,
   activeNode,
   onNodeClick,
 }: {
-  data: DifficultyAnalysis['mindMapData'];
-  subjectId: string;
+  graph: KnowledgeGraph;
   activeNode: string | null;
   onNodeClick: (nodeId: string) => void;
 }) {
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
+  const layoutNodes = useMemo(() => computeLayout(graph), [graph]);
 
-  const layoutNodes = useCallback(
-    (node: MindMapNodeData, depth: number, angle: number, radius: number): MindMapNodeData[] => {
-      const result: MindMapNodeData[] = [];
-      const x = depth === 0 ? 250 : 250 + Math.cos(angle) * radius;
-      const y = depth === 0 ? 220 : 220 + Math.sin(angle) * radius;
-
-      const processedNode: MindMapNodeData = { ...node, x, y };
-      result.push(processedNode);
-
-      if (node.children.length > 0) {
-        const childCount = node.children.length;
-        const angleSpan = depth === 0 ? Math.PI * 2 : Math.PI / 2.5;
-        const startAngle = depth === 0 ? -Math.PI / 2 : angle - angleSpan / 2;
-
-        node.children.forEach((child, index) => {
-          const childAngle =
-            depth === 0
-              ? startAngle + (angleSpan * index) / childCount + angleSpan / (childCount * 2)
-              : startAngle + (angleSpan * index) / (childCount - 1 || 1);
-          const childRadius = depth === 0 ? 90 : 65;
-          result.push(...layoutNodes(child, depth + 1, childAngle, childRadius));
-        });
-      }
-
-      return result;
-    },
-    []
-  );
-
-  const allNodes = useMemo(() => layoutNodes({ ...data }, 0, 0, 0), [data, layoutNodes]);
-  const color = getSubjectColor(subjectId);
-
-  const getNodeStyle = (node: MindMapNodeData) => {
-    if (node.type === 'root') return { fill: color, stroke: color };
-    if (node.type === 'branch') return { fill: `${color}22`, stroke: color, strokeWidth: 2 };
-    return { fill: '#fff', stroke: `${color}88`, strokeWidth: 1.5 };
-  };
-
-  const getTextColor = (node: MindMapNodeData) => {
-    if (node.type === 'root') return '#fff';
-    return '#374151';
-  };
-
-  const getNodeSize = (node: MindMapNodeData) => {
-    if (node.type === 'root') return { rx: 40, ry: 24, width: 120, height: 48 };
-    if (node.type === 'branch') return { rx: 20, ry: 16, width: 110, height: 38 };
-    return { rx: 14, ry: 12, width: 85, height: 30 };
-  };
+  // Compute bounding box
+  const maxR = layoutNodes.reduce((m, n) => Math.max(m, Math.abs(n.x), Math.abs(n.y)), 200);
+  const vb = Math.max(maxR + 100, 400);
+  const cx = 0, cy = 10;
 
   return (
-    <div className="relative w-full h-full min-h-[400px] flex items-center justify-center">
-      <svg viewBox="0 0 500 440" className="w-full h-full max-h-[500px]">
+    <div className="relative w-full h-full min-h-[500px] flex flex-col items-center justify-center">
+      <svg
+        viewBox={`${cx - vb} ${cy - vb - 10} ${vb * 2} ${vb * 2 + 60}`}
+        className="w-full h-full max-h-[580px]"
+      >
         <defs>
-          <filter id={`glow-${subjectId}`}>
-            <feGaussianBlur stdDeviation="3" result="coloredBlur" />
-            <feMerge>
-              <feMergeNode in="coloredBlur" />
-              <feMergeNode in="SourceGraphic" />
-            </feMerge>
-          </filter>
-          <linearGradient id={`lineGrad-${subjectId}`} x1="0%" y1="0%" x2="100%" y2="0%">
-            <stop offset="0%" stopColor={color} stopOpacity="0.6" />
-            <stop offset="100%" stopColor={color} stopOpacity="0.2" />
-          </linearGradient>
+          {Object.entries(NODE_STYLE).map(([type, s]) => (
+            <filter key={type} id={`glow-${type}`}>
+              <feGaussianBlur stdDeviation="4" result="blur" />
+              <feMerge><feMergeNode in="blur" /><feMergeNode in="SourceGraphic" /></feMerge>
+            </filter>
+          ))}
+          <marker id="arrowhead" viewBox="0 0 10 7" refX="9" refY="3.5" markerWidth="8" markerHeight="6" orient="auto">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#94A3B8" />
+          </marker>
         </defs>
 
-        {allNodes.map((node) => {
-          if (!node.x || !node.y || node.type === 'root') return null;
-          const parent = allNodes.find(
-            (n) => n.children?.some((c) => c.id === node.id)
-          );
-          if (!parent || !parent.x || !parent.y) return null;
+        {/* Edges */}
+        {graph.edges.map((edge) => {
+          const source = layoutNodes.find(n => n.id === edge.source);
+          const target = layoutNodes.find(n => n.id === edge.target);
+          if (!source || !target) return null;
+          const style = EDGE_STYLE[edge.type] || EDGE_STYLE.hierarchy;
 
-          const midX = (parent.x + node.x) / 2;
-          const midY = (parent.y + node.y) / 2;
-          const dx = node.x - parent.x;
-          const dy = node.y - parent.y;
-          const ctrlX = parent.x + dx * 0.5;
-          const ctrlY = parent.y + dy * 0.5;
+          const dx = target.x - source.x;
+          const dy = target.y - source.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const midX = (source.x + target.x) / 2;
+          const midY = (source.y + target.y) / 2;
+          const nx = dist > 0 ? dx / dist : 0;
+          const ny = dist > 0 ? dy / dist : 0;
+
+          // Offset to node border
+          const srcSize = NODE_STYLE[source.type]?.size || [50, 22, 12];
+          const tgtSize = NODE_STYLE[target.type]?.size || [50, 22, 12];
+          const sx = source.x + nx * (srcSize[0] / 2 + 4);
+          const sy = source.y + ny * (srcSize[1] / 2 + 4);
+          const tx = target.x - nx * (tgtSize[0] / 2 + 4);
+          const ty = target.y - ny * (tgtSize[1] / 2 + 4);
+          const labelDist = 0.55;
+          const lx = source.x + dx * labelDist;
+          const ly = source.y + dy * labelDist;
 
           return (
-            <motion.path
-              key={`line-${node.id}`}
-              d={`M ${parent.x} ${parent.y} Q ${ctrlX} ${ctrlY} ${node.x} ${node.y}`}
-              fill="none"
-              stroke={`url(#lineGrad-${subjectId})`}
-              strokeWidth={node.type === 'branch' ? 2 : 1.5}
-              strokeOpacity={0.6}
-              initial={{ pathLength: 0 }}
-              animate={{ pathLength: 1 }}
-              transition={{ duration: 0.8, delay: 0.3 + (allNodes.indexOf(node) * 0.08) }}
-            />
+            <g key={edge.id}>
+              <line
+                x1={sx} y1={sy} x2={tx} y2={ty}
+                stroke={style.color}
+                strokeWidth={style.width}
+                strokeDasharray={style.dash}
+                strokeOpacity={0.7}
+                markerEnd={edge.type === 'causal' ? 'url(#arrowhead)' : undefined}
+              />
+              {edge.label && (
+                <g transform={`translate(${lx}, ${ly})`}>
+                  <rect
+                    x={-edge.label.length * 6 - 4} y={-9}
+                    width={edge.label.length * 12 + 8} height={18}
+                    rx={4}
+                    fill="white"
+                    fillOpacity="0.9"
+                    stroke={style.color}
+                    strokeWidth="0.5"
+                  />
+                  <text
+                    textAnchor="middle" dominantBaseline="central"
+                    fontSize="10" fill={style.color} fontWeight="500"
+                  >
+                    {edge.label}
+                  </text>
+                </g>
+              )}
+            </g>
           );
         })}
 
-        {allNodes.map((node, index) => {
-          if (!node.x || !node.y) return null;
-          const size = getNodeSize(node);
-          const style = getNodeStyle(node);
-          const isActive = activeNode === node.id || hoveredNode === node.id;
-          const isRoot = node.type === 'root';
+        {/* Nodes */}
+        {layoutNodes.map((node, index) => {
+          const s = NODE_STYLE[node.type] || NODE_STYLE['sub-concept'];
+          const [w, h, fs] = s.size;
+          const isActive = activeNode === node.id;
+          const isHovered = hoveredNode === node.id;
+          const scale = (isActive || isHovered) ? 1.1 : 1;
+          const isRoot = node.type === 'core';
 
           return (
             <motion.g
               key={node.id}
               initial={{ opacity: 0, scale: 0 }}
-              animate={{
-                opacity: 1,
-                scale: isActive && !isRoot ? 1.12 : 1,
-              }}
-              transition={{
-                duration: 0.5,
-                delay: index * 0.08,
-                scale: { duration: 0.2 },
-              }}
+              animate={{ opacity: 1, scale }}
+              transition={{ duration: 0.5, delay: index * 0.06 }}
               onMouseEnter={() => setHoveredNode(node.id)}
               onMouseLeave={() => setHoveredNode(null)}
-              onClick={() => node.type !== 'root' && onNodeClick(node.id)}
-              style={{ cursor: node.type !== 'root' ? 'pointer' : 'default' }}
+              onClick={() => onNodeClick(node.id)}
+              style={{ cursor: 'pointer' }}
             >
-              {isActive && !isRoot && (
+              {/* Glow ring when active */}
+              {isActive && (
                 <rect
-                  x={node.x! - size.width / 2 - 4}
-                  y={node.y! - size.height / 2 - 4}
-                  width={size.width + 8}
-                  height={size.height + 8}
-                  rx={size.rx + 2}
-                  ry={size.ry + 2}
-                  fill={`${color}15`}
-                  stroke={color}
-                  strokeWidth={1.5}
-                  strokeDasharray="4 2"
+                  x={node.x - w / 2 - 6} y={node.y - h / 2 - 6}
+                  width={w + 12} height={h + 12}
+                  rx={h / 2 + 6} ry={h / 2 + 6}
+                  fill="none"
+                  stroke={s.stroke}
+                  strokeWidth="2"
+                  strokeDasharray="4 3"
+                  opacity="0.5"
                 />
               )}
 
               <rect
-                x={node.x! - size.width / 2}
-                y={node.y! - size.height / 2}
-                width={size.width}
-                height={size.height}
-                rx={size.rx}
-                ry={size.ry}
-                {...style}
-                filter={isRoot ? `url(#glow-${subjectId})` : undefined}
+                x={node.x - w / 2} y={node.y - h / 2}
+                width={w} height={h}
+                rx={h / 2} ry={h / 2}
+                fill={s.fill}
+                stroke={s.stroke}
+                strokeWidth={isRoot ? 2.5 : 1.5}
+                filter={isRoot ? `url(#glow-core)` : undefined}
               />
 
               <text
-                x={node.x!}
-                y={node.y!}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fill={getTextColor(node)}
-                fontSize={isRoot ? 14 : node.type === 'branch' ? 11 : 10}
-                fontWeight={isRoot ? 700 : node.type === 'branch' ? 600 : 500}
+                x={node.x} y={node.y}
+                textAnchor="middle" dominantBaseline="central"
+                fill={s.text}
+                fontSize={isRoot ? fs + 1 : fs}
+                fontWeight={isRoot ? 700 : 600}
                 pointerEvents="none"
               >
-                {node.label}
+                {node.label.length > 8 ? node.label.slice(0, 7) + '…' : node.label}
               </text>
-
-              {isActive && node.type !== 'root' && (
-                <motion.text
-                  x={node.x! + size.width / 2 + 8}
-                  y={node.y!}
-                  dominantBaseline="central"
-                  fill={color}
-                  fontSize={16}
-                  initial={{ opacity: 0, x: size.width / 2 }}
-                  animate={{ opacity: 1, x: size.width / 2 + 8 }}
-                  transition={{ duration: 0.2 }}
-                  pointerEvents="none"
-                >
-                  ▶
-                </motion.text>
-              )}
             </motion.g>
           );
         })}
+
+        {/* Legend */}
+        <g transform={`translate(${cx - vb + 16}, ${cy + vb - 8})`}>
+          {Object.entries(NODE_STYLE).map(([type, s], i) => {
+            const x = i * 112;
+            return (
+              <g key={type} transform={`translate(${x}, 0)`}>
+                <circle cx="5" cy="0" r="5" fill={s.fill} stroke={s.stroke} strokeWidth="1" />
+                <text x="14" y="4" fontSize="10" fill="#64748B">{TYPE_LABEL[type]}</text>
+              </g>
+            );
+          })}
+        </g>
       </svg>
 
+      {/* Hover tooltip */}
       <AnimatePresence>
-        {hoveredNode && hoveredNode !== 'root' && (() => {
-          const node = allNodes.find((n) => n.id === hoveredNode);
-          if (!node) return null;
+        {hoveredNode && (() => {
+          const node = layoutNodes.find(n => n.id === hoveredNode);
+          if (!node || !node.description) return null;
           return (
             <motion.div
               initial={{ opacity: 0, y: 5 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 5 }}
-              className="absolute bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 bg-gray-900 text-white text-sm rounded-lg shadow-lg pointer-events-none z-10"
+              className="absolute bottom-3 left-1/2 -translate-x-1/2 px-4 py-2 bg-gray-900 text-white text-xs rounded-lg shadow-lg pointer-events-none z-10 max-w-[280px] text-center"
             >
-              点击查看「{node.label}」详情
+              <span className="font-semibold">{node.label}</span>
+              {node.description && <span className="text-gray-300 ml-2">{node.description}</span>}
             </motion.div>
           );
         })()}
@@ -689,11 +785,28 @@ function AdvancedTab({ data }: { data: DifficultyAnalysis }) {
   );
 }
 
+const SESSION_KEY = 'difficulty-analyzer-session';
+
+function loadSession(): { topic: string; subjectId: string; gradeId: string; result: DifficultyAnalysis | null } | null {
+  try {
+    const saved = localStorage.getItem(SESSION_KEY);
+    return saved ? JSON.parse(saved) : null;
+  } catch { return null; }
+}
+
+function saveSession(data: { topic: string; subjectId: string; gradeId: string; result: DifficultyAnalysis | null }) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  } catch { /* ignore */ }
+}
+
 export default function DifficultyAnalyzer() {
-  const [topic, setTopic] = useState('');
-  const [subjectId, setSubjectId] = useState('math');
+  const session = useRef(loadSession());
+  const [topic, setTopic] = useState(session.current?.topic || '');
+  const [subjectId, setSubjectId] = useState(session.current?.subjectId || 'math');
+  const [gradeId, setGradeId] = useState(session.current?.gradeId || 'grade-9');
   const [analyzing, setAnalyzing] = useState(false);
-  const [result, setResult] = useState<DifficultyAnalysis | null>(null);
+  const [result, setResult] = useState<DifficultyAnalysis | null>(session.current?.result || null);
   const [activeTab, setActiveTab] = useState<DetailTab>('concept');
   const [activeMindMapNode, setActiveMindMapNode] = useState<string | null>(null);
   const [searchFocused, setSearchFocused] = useState(false);
@@ -705,7 +818,12 @@ export default function DifficultyAnalyzer() {
       return [];
     }
   });
-  const { addToRecentHistory } = useAppStore();
+  const { addToHistory: addToRecentHistory, addNotification } = useAppStore();
+
+  // 会话持久化：切换页面不丢失状态
+  useEffect(() => {
+    saveSession({ topic, subjectId, gradeId, result });
+  }, [topic, subjectId, gradeId, result]);
 
   const filteredTags = useMemo(() => {
     if (!topic.trim()) return recommendedTags;
@@ -722,7 +840,7 @@ export default function DifficultyAnalyzer() {
     setActiveMindMapNode(null);
 
     try {
-      const analysisResult = await aiService.analyzeDifficulty(subjectId, 'grade_3', topic);
+      const analysisResult = await aiService.analyzeDifficulty(subjectId, gradeId, topic);
       setResult(analysisResult);
 
       const newHistoryItem: HistoryItem = {
@@ -741,11 +859,16 @@ export default function DifficultyAnalyzer() {
         type: 'analysis',
         title: `${subjects.find(s => s.id === subjectId)?.name || ''} - ${topic}`,
         subjectId,
-        gradeId: 'grade_3',
+        gradeId,
         content: '',
       });
-    } catch (error) {
+    } catch (error: any) {
       console.error('Analysis failed:', error);
+      addNotification({
+        type: 'error',
+        title: '分析失败',
+        message: error?.message || '请检查网络连接后重试',
+      });
     } finally {
       setAnalyzing(false);
     }
@@ -762,15 +885,7 @@ export default function DifficultyAnalyzer() {
   };
 
   const handleMindMapNodeClick = (nodeId: string) => {
-    setActiveMindMapNode(nodeId);
-    const tabMap: Record<string, DetailTab> = {
-      c1: 'concept', c2: 'concept', c3: 'concept',
-      e1: 'examples', e2: 'examples', e3: 'examples',
-      m1: 'mistakes', m2: 'mistakes', m3: 'mistakes',
-      a1: 'advanced', a2: 'advanced', a3: 'advanced',
-    };
-    const targetTab = tabMap[nodeId];
-    if (targetTab) setActiveTab(targetTab);
+    setActiveMindMapNode(prev => prev === nodeId ? null : nodeId);
   };
 
   const handleClearHistory = () => {
@@ -841,6 +956,19 @@ export default function DifficultyAnalyzer() {
                   {subjects.map((s) => (
                     <option key={s.id} value={s.id}>
                       {s.icon} {s.name}
+                    </option>
+                  ))}
+                </select>
+
+                <select
+                  value={gradeId}
+                  onChange={(e) => setGradeId(e.target.value)}
+                  className="w-full px-4 py-2.5 rounded-xl border border-gray-200 bg-white text-sm text-gray-700 focus:outline-none focus:ring-2 transition-all appearance-none cursor-pointer"
+                  style={{ '--tw-ring-color': subjectColor } as React.CSSProperties}
+                >
+                  {grades.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {g.name}
                     </option>
                   ))}
                 </select>
@@ -985,12 +1113,11 @@ export default function DifficultyAnalyzer() {
                       />
                       知识图谱
                     </h3>
-                    <span className="text-xs text-gray-400">点击节点查看详情</span>
+                    <span className="text-xs text-gray-400">点击节点高亮</span>
                   </div>
                   <div className="flex-1 min-h-0">
-                    <MindMapVisualization
-                      data={result.mindMapData}
-                      subjectId={subjectId}
+                    <KnowledgeGraphView
+                      graph={result.knowledgeGraph}
                       activeNode={activeMindMapNode}
                       onNodeClick={handleMindMapNodeClick}
                     />

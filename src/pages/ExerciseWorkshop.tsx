@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from 'react';
+import { useState, useCallback, useMemo, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   PenTool,
@@ -134,15 +134,48 @@ function getDifficultyForIndex(index: number, total: number, dist: ExerciseConfi
   return 'hard';
 }
 
+const EXERCISE_SESSION_KEY = 'exercise-workshop-session';
+
+function loadExerciseSession(): { config: ExerciseConfig; exerciseSet: ExerciseSet | null } | null {
+  try {
+    const saved = localStorage.getItem(EXERCISE_SESSION_KEY);
+    return saved ? JSON.parse(saved) : null;
+  } catch { return null; }
+}
+
+function saveExerciseSession(data: { config: ExerciseConfig; exerciseSet: ExerciseSet | null }) {
+  try {
+    localStorage.setItem(EXERCISE_SESSION_KEY, JSON.stringify(data));
+  } catch { /* ignore */ }
+}
+
 export default function ExerciseWorkshop() {
+  const session = useRef(loadExerciseSession());
   const { addNotification, addToHistory } = useAppStore();
-  const [config, setConfig] = useState<ExerciseConfig>(DEFAULT_CONFIG);
+  const [config, setConfig] = useState<ExerciseConfig>(session.current?.config || DEFAULT_CONFIG);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generateProgress, setGenerateProgress] = useState(0);
-  const [exerciseSet, setExerciseSet] = useState<ExerciseSet | null>(null);
-  const [exercises, setExercises] = useState<ExtendedExercise[]>([]);
+  const [exerciseSet, setExerciseSet] = useState<ExerciseSet | null>(session.current?.exerciseSet || null);
+  const [exercises, setExercises] = useState<ExtendedExercise[]>(() => {
+    if (!session.current?.exerciseSet) return [];
+    const { config: savedConfig } = session.current;
+    return session.current.exerciseSet.exercises.map((ex, i) => {
+      let displayType = ex.type;
+      if (!savedConfig.advancedOptions.mixTypes && savedConfig.types.length === 1) {
+        const serviceType = QUESTION_TYPE_CONFIG[savedConfig.types[0]].serviceType;
+        displayType = serviceType as Exercise['type'];
+      }
+      const difficulty = getDifficultyForIndex(i, session.current!.exerciseSet!.exercises.length, savedConfig.difficultyDistribution);
+      return { ...ex, type: displayType, difficulty, index: i, showAnswer: false, isEditing: false, selected: false, isDeleting: false };
+    });
+  });
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [selectAll, setSelectAll] = useState(false);
+
+  // 会话持久化
+  useEffect(() => {
+    saveExerciseSession({ config, exerciseSet });
+  }, [config, exerciseSet]);
 
   const updateConfig = useCallback(<K extends keyof ExerciseConfig>(key: K, value: ExerciseConfig[K]) => {
     setConfig(prev => ({ ...prev, [key]: value }));
@@ -236,7 +269,7 @@ export default function ExerciseWorkshop() {
         title: `${config.topic} - 练习题集`,
         subjectId: config.subjectId,
         gradeId: config.gradeId,
-        summary: `生成 ${result.exercises.length} 道练习题`,
+        content: `生成 ${result.exercises.length} 道练习题`,
       });
 
       setTimeout(() => {

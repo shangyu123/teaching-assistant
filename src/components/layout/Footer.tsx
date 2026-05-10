@@ -46,7 +46,7 @@ export default function Footer() {
         {/* 分割线 */}
         <div className="mt-6 pt-6 border-t border-gray-200">
           <p className="text-center text-sm text-gray-400 flex items-center justify-center gap-1">
-            © 2024 乡村教师智能教学助手 - 让每一堂课都精彩
+            © 2026 乡村教师智能教学助手 - 让每一堂课都精彩
             <Heart className="w-3.5 h-3.5 text-red-400 inline-block" />
           </p>
         </div>
